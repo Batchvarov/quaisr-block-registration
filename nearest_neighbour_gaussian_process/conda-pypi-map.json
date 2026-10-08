@@ -1,0 +1,4 @@
+{
+  "cuda-bindings": "cuda-bindings",
+  "cuda-pathfinder": "cuda-pathfinder"
+}

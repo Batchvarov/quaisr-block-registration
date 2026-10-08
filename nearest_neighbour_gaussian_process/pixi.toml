@@ -1,0 +1,77 @@
+[workspace]
+name = "nearest-neighbour-gaussian-process"
+channels = ["pytorch", "nvidia", "rapidsai", "conda-forge"]
+# faiss GPU (no reliable PyPI wheel) + the non-Python build tools it and pykeops
+# need. Everything Python comes from PyPI (see below).
+# conda-forge faiss-gpu has NO CUDA 13 build; the CUDA 13 build ships as
+# faiss-gpu-cuvs on the rapidsai channel (needs libnvjitlink from nvidia).
+# faiss-gpu-cuvs requires glibc >=2.34; the noble base image ships 2.39. Raise
+# the solver's assumed glibc (declared inline on the platform) so the cuvs build
+# is a viable candidate.
+platforms = [{ platform = "linux-64", glibc = "2.34" }]
+
+# Skip the remote conda->PyPI name mapping fetch (conda-mapping.prefix.dev):
+# the build env has no outbound access to it. `mapping-mode = "replace"` uses our
+# local map instead of the remote one, per channel. pixi's offline same-name
+# heuristic (still ON) dedupes conda vs PyPI packages of the same name so the
+# conda build wins and PyPI only fills gaps -- that already covers numpy /
+# setuptools / packaging. The CUDA python packages below are listed explicitly:
+# the heuristic alone was not tagging them, so uv reinstalled the PyPI wheels
+# over the conda (faiss cuvs) ones and clobbered them. Naming them here locks the
+# conda versions so uv leaves them alone.
+[workspace.conda-pypi-map]
+pytorch     = { location = "conda-pypi-map.json", mapping-mode = "replace" }
+nvidia      = { location = "conda-pypi-map.json", mapping-mode = "replace" }
+rapidsai    = { location = "conda-pypi-map.json", mapping-mode = "replace" }
+conda-forge = { location = "conda-pypi-map.json", mapping-mode = "replace" }
+
+[dependencies]
+python         = "3.12.*"   # faiss-gpu-cuvs 1.14.3 has no py3.13 build
+faiss-gpu-cuvs = "1.14.3"
+libnvjitlink   = "*"        # runtime dep of the cuvs faiss build
+cuda-version   = "13.*"     # align faiss cuda runtime with the torch cu130 wheels
+# Granular CUDA toolkit pieces pykeops needs to JIT-compile at runtime. The
+# `cuda-toolkit` metapackage does NOT solve in this channel set (its cuda-libraries
+# dep drags libcuobjclient -> libnuma>=2.0.19, unavailable on conda-forge), so we
+# name the pieces. IMPORTANT: use the *-dev variants -- keops checks for the
+# headers (nvrtc.h, cuda_runtime.h, cccl/nv headers), not just the runtime libs.
+cuda-nvcc       = "*"       # nvcc + crt (build tool)
+cuda-cudart-dev = "*"       # libcudart + cuda_runtime.h / cuda_fp16.h
+cuda-nvrtc-dev  = "*"       # libnvrtc + builtins + nvrtc.h (runtime lib alone lacks the header)
+cuda-driver-dev = "*"       # cuda.h (driver API header) -- NOT in cudart-dev; keops #includes it
+cuda-cccl       = "*"       # CUB / Thrust / libcu++ (<nv/...>) headers
+cxx-compiler    = "*"       # host g++ for nvcc (base image has no system compiler)
+pip            = "*"        # for the `pixi run pip install quaisr` step in the Dockerfile
+
+# Everything Python from PyPI. torch pulls its bundled CUDA 13 libs from the
+# pytorch cu130 index. upscaling-tools is installed WITHOUT its [gp-gpu] extra
+# on purpose: that extra drags faiss-gpu off PyPI (broken); faiss comes from
+# conda-forge above. torch/gpytorch/pykeops/botorch are declared explicitly.
+[pypi-dependencies]
+torch      = ">=2.9"
+gpytorch   = ">=1.14.3"
+pykeops    = ">=2.3"
+hilbertsfc = { version = "*", extras = ["torch"] }
+kneed      = ">=0.8.5"
+pyarrow    = ">=15"
+upscaling-tools = { path = "./nearest_neighbour_gaussian_process/upscaling_tools/upscaling_tools-0.3.14-py3-none-any.whl" }
+botorch         = { path = "./nearest_neighbour_gaussian_process/upscaling_tools/botorch-0.1.dev2469+g847979a86-py3-none-any.whl" }
+
+[activation.env]
+CUDA_PATH          = "$CONDA_PREFIX"   # pykeops locates nvcc / cuda headers
+KEOPS_CACHE_FOLDER = "/tmp/keops"      # writable JIT cache for the non-root user
+# conda ships the CUDA headers under $CONDA_PREFIX/targets/x86_64-linux/include,
+# NOT $CONDA_PREFIX/include -- so keops's CUDA_PATH/include check misses them and
+# nvcc can't find cuda.h/nvrtc.h. Put that dir on CPATH so keops's compiler probe
+# and nvcc both resolve the headers. (gcc/nvcc honor CPATH for C and C++.)
+CPATH              = "$CONDA_PREFIX/targets/x86_64-linux/include"
+# nvcc needs a host C++ compiler; the base image has no /usr/bin/g++, only the
+# conda one. Point nvcc at it explicitly so keops JIT compiles succeed.
+CXX                = "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
+CUDAHOSTCXX        = "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
+# `pixi run` re-activates the env and drops the base image's LD_LIBRARY_PATH,
+# which is where the nvidia container runtime mounts libcuda.so.1 at run time.
+# pykeops dlopen's libcuda.so to probe the GPU; without these dirs the probe
+# fails with "CUDA libraries not found" and it silently falls back to CPU.
+# Order: conda libs first (cudart/nvrtc), then the host-mounted driver dirs.
+LD_LIBRARY_PATH    = "$CONDA_PREFIX/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib/x86_64-linux-gnu"
